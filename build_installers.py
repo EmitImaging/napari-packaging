@@ -49,6 +49,7 @@ import json
 import os
 import platform
 import sys
+import shutil
 import zipfile
 from argparse import ArgumentParser
 from functools import lru_cache, partial
@@ -75,6 +76,7 @@ APP = os.environ.get('CONSTRUCTOR_APP_NAME', 'napari')
 # bump this when something in the installer infrastructure changes
 # note that this will affect the default installation path across platforms!
 INSTALLER_VERSION = os.environ.get('CONSTRUCTOR_INSTALLER_VERSION', '0.1')
+LOCAL_CHANNEL_URL = os.environ.get("CONSTRUCTOR_LOCAL_CHANNEL_URL")
 HERE = os.path.abspath(os.path.dirname(__file__))
 WINDOWS = os.name == 'nt'
 MACOS = sys.platform == 'darwin'
@@ -202,10 +204,13 @@ def _generate_background_images(
 
 def _get_condarc():
     prompt = '[napari]({default_env}) '
+    extra = ""
+    if LOCAL_CHANNEL_URL:
+        extra = f"  - file:///${{PREFIX}}/pkgs\n"
     contents = dedent(
         f"""
         channels:  #!final
-          - napari
+        {extra}  - napari
           - conda-forge
         repodata_fns:  #!final
           - repodata.json
@@ -215,8 +220,6 @@ def _get_condarc():
         env_prompt: '{prompt}'  #! final
         """
     )
-    # the undocumented #!final comment is explained here
-    # https://www.anaconda.com/blog/conda-configuration-engine-power-users
     with NamedTemporaryFile(delete=False, mode='w+') as f:
         f.write(contents)
     return f.name
@@ -253,19 +256,25 @@ def _napari_env(
     pyside_version=PYSIDE_VER,
     extra_specs=None,
 ):
+    # If we're bundling local builds, don't hard-pin versions.
+    # Local channel precedence will pick up your freshly built packages.
+    if _use_local():
+        napari_specs = ['napari', 'napari-menu']
+        env_name_version = napari_version  # keep the env name as-is if you want
+    else:
+        napari_specs = [f'napari={napari_version}', f'napari-menu={napari_version}']
+        env_name_version = napari_version
+
     return {
-        'name': f'napari-{napari_version}',
-        # "channels": same as _base_env(), omit to inherit :)
+        'name': f'napari-{env_name_version}',
         'specs': [
             f'python={python_version}.*',
-            f'napari={napari_version}',
-            f'napari-menu={napari_version}',
+            *napari_specs,
             'napari-plugin-manager',
             f'pyside6={pyside_version}',
             *CONDA_TOOL_DEPS,
             *(extra_specs or ()),
         ],
-        # "exclude": exclude, # TODO: not supported yet in constructor
     }
 
 
@@ -276,9 +285,16 @@ def _definitions(version=_version(), extra_specs=None, napari_repo=HERE):
     empty_file = NamedTemporaryFile(delete=False)
     condarc = _get_condarc()
     env_state = _get_conda_meta_state()
-    env_state_path = os.path.join(
-        'envs', napari_env['name'], 'conda-meta', 'state'
-    )
+    env_state_path = os.path.join('conda-meta', 'state')
+
+    main_specs = []
+    for spec in base_env['specs']:
+        if spec not in main_specs:
+            main_specs.append(spec)
+    for spec in napari_env['specs']:
+        if spec not in main_specs:
+            main_specs.append(spec)
+
     definitions = {
         'name': APP,
         'company': 'Napari',
@@ -290,14 +306,9 @@ def _definitions(version=_version(), extra_specs=None, napari_repo=HERE):
         'initialize_conda': False,
         'initialize_by_default': False,
         'license_file': os.path.join(resources, 'bundle_license.rtf'),
-        'specs': base_env['specs'],
-        'extra_envs': {
-            napari_env['name']: {
-                'specs': napari_env['specs'],
-                'menu_packages': ['napari-menu'],
-            },
-        },
+        'specs': main_specs,
         'register_envs': False,
+        'menu_packages': ['napari-menu'],
         'extra_files': [
             {os.path.join(resources, 'bundle_readme.md'): 'README.txt'},
             {empty_file.name: '.napari_is_bundled_constructor'},
@@ -305,12 +316,14 @@ def _definitions(version=_version(), extra_specs=None, napari_repo=HERE):
             {env_state: env_state_path},
         ],
         'build_outputs': [
-            {'lockfile': {'env': napari_env['name']}},
+            {'lockfile': {}},
             {'licenses': {'include_text': True, 'text_errors': 'replace'}},
         ],
     }
-    if _use_local():
-        definitions['channels'].insert(0, 'local')
+    if LOCAL_CHANNEL_URL:
+        definitions["channels"].insert(0, LOCAL_CHANNEL_URL)
+    elif _use_local():
+        definitions["channels"].insert(0, "local")
     if LINUX:
         definitions['default_prefix'] = os.path.join(
             '$HOME', '.local', INSTALLER_DEFAULT_PATH_STEM
@@ -452,8 +465,24 @@ def _constructor(version=_version(), extra_specs=None, napari_repo=HERE):
     with open('construct.yaml', 'w') as fin:
         yaml.dump(definitions, fin)
 
-    check_call(args, env=env)
+    # Register post-install hook on Windows
+    if WINDOWS:
+        src = Path(__file__).parent / "scripts" / "post_install.bat"
+        if not src.exists():
+            raise RuntimeError(f"Missing post-install script: {src}")
 
+        # constructor expects the post_install script next to construct.yaml at build time
+        shutil.copy(src, Path("post_install.bat"))
+
+        # THIS is the critical part: tell constructor it's the post-install hook
+        definitions["post_install"] = "post_install.bat"
+
+        # re-write construct.yaml including post_install
+        with open("construct.yaml", "w") as fin:
+            yaml.dump(definitions, fin)
+
+    check_call(args, env=env)
+    
     return OUTPUT_FILENAME
 
 
