@@ -51,6 +51,7 @@ import platform
 import sys
 import shutil
 import zipfile
+import tempfile
 from argparse import ArgumentParser
 from functools import lru_cache, partial
 from pathlib import Path
@@ -340,6 +341,11 @@ def _definitions(version=_version(), extra_specs=None, napari_repo=HERE):
         definitions['default_location_pkg'] = 'Library'
         definitions['installer_type'] = 'pkg'
         definitions['progress_notifications'] = True
+        definitions['pkg_domains'] = {
+            'enable_anywhere': False,
+            'enable_currentUserHome': False,
+            'enable_localSystem': True,
+        }
         definitions['welcome_image'] = os.path.join(
             resources, 'napari_1227x600.png'
         )
@@ -439,7 +445,16 @@ def _constructor(version=_version(), extra_specs=None, napari_repo=HERE):
         version=version, extra_specs=extra_specs, napari_repo=napari_repo
     )
 
-    args = [constructor, '-v', '.']
+    cache_dir = Path('constructor-cache')
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    args = [
+        constructor,
+        '-v',
+        '--cache-dir',
+        str(cache_dir.resolve()),
+        '.',
+    ]
 
     if TARGET_PLATFORM and CONDA_EXE:
         args += ['--platform', TARGET_PLATFORM, '--conda-exe', CONDA_EXE]
@@ -465,24 +480,34 @@ def _constructor(version=_version(), extra_specs=None, napari_repo=HERE):
     with open('construct.yaml', 'w') as fin:
         yaml.dump(definitions, fin)
 
-    # Register post-install hook on Windows
+    # Register post-install hook
     if WINDOWS:
         src = Path(__file__).parent / "scripts" / "post_install.bat"
         if not src.exists():
             raise RuntimeError(f"Missing post-install script: {src}")
 
-        # constructor expects the post_install script next to construct.yaml at build time
         shutil.copy(src, Path("post_install.bat"))
-
-        # THIS is the critical part: tell constructor it's the post-install hook
         definitions["post_install"] = "post_install.bat"
 
-        # re-write construct.yaml including post_install
-        with open("construct.yaml", "w") as fin:
-            yaml.dump(definitions, fin)
+    elif MACOS:
+        src = Path(__file__).parent / "scripts" / "post_install.sh"
+        if not src.exists():
+            raise RuntimeError(f"Missing post-install script: {src}")
+
+        shutil.copy(src, Path("post_install.sh"))
+        os.chmod("post_install.sh", 0o755)
+
+        definitions["post_install"] = "post_install.sh"
+
+    # re-write construct.yaml including post_install
+    with open("construct.yaml", "w") as fin:
+        yaml.dump(definitions, fin)
 
     check_call(args, env=env)
-    
+
+    if MACOS:
+        _patch_macos_pkg_scripts(Path(OUTPUT_FILENAME))
+
     return OUTPUT_FILENAME
 
 
@@ -529,6 +554,60 @@ def lockfiles():
         contents = txtfile.read_text().replace(local_channel, remote_channel)
         txtfile.write_text(contents)
     return txtfile.resolve()
+
+def _patch_macos_pkg_scripts(pkg_path: Path) -> None:
+    """
+    Patch constructor-generated macOS pkg scripts:
+    - avoid chown of ~/.conda and ~/.condarc in run_installation.pkg
+    - make cache cleanup best-effort in cacheclean.pkg
+    """
+    if not MACOS:
+        return
+    if not pkg_path.exists():
+        raise FileNotFoundError(f"PKG not found: {pkg_path}")
+
+    with tempfile.TemporaryDirectory(prefix="napari-pkg-patch-") as td:
+        td_path = Path(td)
+        expanded = td_path / "expanded"
+
+        check_call(["pkgutil", "--expand", str(pkg_path), str(expanded)])
+
+        # Patch run_installation postinstall
+        run_postinstall = expanded / "run_installation.pkg" / "Scripts" / "postinstall"
+        if run_postinstall.exists():
+            text = run_postinstall.read_text()
+            text = text.replace(
+                'test -d "${HOME}/.conda" && chown -R "${USER}" "${HOME}/.conda"',
+                '# patched out by napari packaging: avoid chown of ~/.conda during pkg install',
+            )
+            text = text.replace(
+                'test -f "${HOME}/.condarc" && chown "${USER}" "${HOME}/.condarc"',
+                '# patched out by napari packaging: avoid chown of ~/.condarc during pkg install',
+            )
+            run_postinstall.write_text(text)
+            os.chmod(run_postinstall, 0o755)
+
+        # Patch cacheclean postinstall
+        cacheclean_postinstall = expanded / "cacheclean.pkg" / "Scripts" / "postinstall"
+        if cacheclean_postinstall.exists():
+            text = cacheclean_postinstall.read_text()
+
+            # Make rm best-effort instead of fatal
+            text = text.replace(
+                'rm -rf "$PREFIX/pkgs"',
+                'rm -rf "$PREFIX/pkgs" || echo "Warning: failed to completely remove $PREFIX/pkgs"',
+            )
+
+            # Extra safety: ensure script exits successfully after cleanup
+            if 'exit 0' not in text:
+                text += '\n\nexit 0\n'
+
+            cacheclean_postinstall.write_text(text)
+            os.chmod(cacheclean_postinstall, 0o755)
+
+        patched_pkg = td_path / pkg_path.name
+        check_call(["pkgutil", "--flatten", str(expanded), str(patched_pkg)])
+        shutil.move(str(patched_pkg), str(pkg_path))
 
 
 def main(extra_specs=None, napari_repo=HERE):

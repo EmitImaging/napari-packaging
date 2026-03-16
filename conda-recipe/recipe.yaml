@@ -159,7 +159,7 @@ outputs:
     build:
       noarch: python
       script:
-        - python "%RECIPE_DIR%\\build_menu.py"
+        - python ${{ RECIPE_DIR }}/build_menu.py
     requirements:
       host:
         - python ${{ python_min }}.*
